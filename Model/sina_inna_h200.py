@@ -35,7 +35,7 @@ NUM_WORKERS = 8
 
 USE_AMP = True          # Use Automatic Mixed Precision (FP16)
 
-DATASETS_TO_RUN = ['MNIST', 'CIFAR10', 'CIFAR100']
+DATASETS_TO_RUN = ['CIFAR10', 'CIFAR100'] # cifar only on h200
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == 'cuda':

@@ -218,7 +218,7 @@ def evaluate(model, loader, device, eps=None, use_amp=False):
             y = y.to(device, non_blocking=True)
 
             if use_amp and device.type == "cuda":
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with autocast(dtype=torch.bfloat16):
                     out = model(x, eps=eps)
             else:
                 out = model(x, eps=eps)
@@ -275,7 +275,7 @@ def train_inna_instance(device, epochs, dataset, alpha, beta, lr=0.05, decay=0.5
             opt.zero_grad(set_to_none=True)
 
             if use_amp:
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with autocast(dtype=torch.bfloat16):
                     out = model(x, eps=None)
                     loss = crit(out, y)
             else:
@@ -326,7 +326,7 @@ def train_sina_instance(device, epochs, dataset, alpha, beta, gamma0, eps0, deca
             model.zero_grad(set_to_none=True)
             
             if use_amp:
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with autocast(dtype=torch.bfloat16):
                     out = model(x, eps=state["eps"])
                     loss = crit(out, y)
             else:

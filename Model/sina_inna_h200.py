@@ -63,7 +63,8 @@ def zang_plus(t, eps):
     mid = (~gt) & (~lt)
     out = torch.zeros_like(t)
     out[gt] = t[gt]
-    out[mid] = 0.5 / eps_t * (t[mid] + half) ** 2
+    val = 0.5 / eps_t * (t[mid] + half ) ** 2
+    out[mid] = val.to(out.dtype)
     return out
 
 class NiNBlock(nn.Module):

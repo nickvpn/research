@@ -4,8 +4,6 @@
 # =============================================================================
 #
 # This script is designed to be copied to a remote GPU machine and executed.
-# Your local laptop (i7-1165G7, 16GB, no GPU) cannot run these experiments
-# in reasonable time.
 #
 # OPTIONS FOR RUNNING:
 #
@@ -14,13 +12,8 @@
 #    ssh user@gpu-server
 #    cd ~/sina_experiments && bash run_gpu.sh
 #
-# 2. Google Colab:
-#    Upload the fixes/ folder, then run the commands below in a cell.
 #
-# 3. Lambda Labs / Vast.ai / RunPod:
-#    Spin up an instance with PyTorch pre-installed, upload files, run.
-#
-# 4. SLURM cluster:
+# 2. SLURM cluster:
 #    See the SLURM section at the bottom of this file.
 #
 # =============================================================================

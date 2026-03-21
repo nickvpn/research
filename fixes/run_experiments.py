@@ -1,32 +1,31 @@
 """
 Complete experiment script for SINA vs INNA comparison.
 
-Reproduces the experiments from:
-  - Castera et al. (2021) "An Inertial Newton Algorithm for Deep Learning" (INNA paper)
-  - Chadli et al. (2025) "A smoothing approximation approach to dynamical inertial
-    newton systems..." (SINA paper)
+Phase 1: Reproduce INNA paper (Castera et al. 2021, JMLR)
+  - Figure 2: INNA (alpha,beta) sensitivity study
+  - Figure 3: INNA vs SGD vs ADAM vs ADAGRAD
+  - Figure 4: Step-size decay exponent comparison
 
-What this script runs (matching the INNA paper's Section 5):
-  1. INNA (alpha,beta) sensitivity study — Figure 2
-  2. INNA vs SGD vs ADAM vs ADAGRAD comparison — Figure 3
-  3. INNA step-size decay exponent comparison — Figure 4
-  4. SINA (Algorithm 4.1 with adaptive epsilon) vs INNA
-  5. SINA hyperparameter search (grid + Bayesian)
+Phase 2: SINA comparison (Chadli et al. 2025, Optimization)
+  - Grid search constant gamma for SINA
+  - Delta-sigma sensitivity study
+  - Full runs with dual evaluation (smoothed + ReLU)
+  - SINA vs INNA comparison plots + epsilon trajectory
 
 All experiments use:
-  - Network in Network (NiN) architecture with BatchNorm
-  - MNIST, CIFAR-10, CIFAR-100 datasets
-  - 200 epochs, 5 random seeds
-  - Batch size 32 (matching the INNA paper; configurable)
-  - Step-size gamma_k = gamma_0 / sqrt(k+1) per ITERATION for INNA/SGD
-  - ADAM and ADAGRAD use their own adaptive rates
+  - Network in Network (NiN) architecture with BatchNorm (~10^6 params)
+  - MNIST, CIFAR-10, CIFAR-100
+  - 200 epochs, 5 random seeds, batch size 32 (matching INNA paper)
+  - gamma_k = gamma_0 / sqrt(k+1) per ITERATION for INNA/SGD
   - gamma_0 selected by grid search on TRAINING LOSS after 15 epochs
+  - Min/max shading on plots (matching INNA paper style)
 
 Usage:
-  python run_experiments.py                          # Run everything
-  python run_experiments.py --datasets CIFAR10       # Single dataset
-  python run_experiments.py --skip-baselines         # Skip SGD/ADAM/ADAGRAD
-  python run_experiments.py --batch-size 256 --gpu   # Override for fast GPU
+  python run_experiments.py                            # Run everything
+  python run_experiments.py --phases 1                 # Phase 1 only
+  python run_experiments.py --phases 2                 # Phase 2 only (needs Phase 1 cached)
+  python run_experiments.py --datasets CIFAR10         # Single dataset
+  python run_experiments.py --batch-size 256 --compile # GPU-optimized
 """
 
 import matplotlib
@@ -40,7 +39,6 @@ import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import sys
 import time
 import json
 import argparse
@@ -48,62 +46,47 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Import our fixed optimizers (in same directory)
 from inna_optimizer import INNA as INNAOptimizer
-from sina_optimizer import (
+from research.fixes.sina_optimizer_copy import (
     zang_plus, sina_step_fn, sina_update_epsilon,
     compute_grad_norm, initialize_phi, initialize_phi_from_grad,
 )
 
+
 # ============================================================
 # 0. CONFIGURATION
 # ============================================================
+GAMMA0_GRID = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="SINA/INNA Experiments")
-    parser.add_argument('--datasets', nargs='+',
-                        default=['MNIST', 'CIFAR10', 'CIFAR100'],
-                        choices=['MNIST', 'CIFAR10', 'CIFAR100'])
-    parser.add_argument('--full-epochs', type=int, default=200,
-                        help='Epochs for full training runs (default: 200)')
-    parser.add_argument('--search-epochs', type=int, default=15,
-                        help='Epochs for hyperparameter search (default: 15)')
-    parser.add_argument('--num-seeds', type=int, default=5,
-                        help='Number of random seeds (default: 5)')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size (default: 32, matching INNA paper)')
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--gpu', action='store_true',
-                        help='Use GPU if available')
-    parser.add_argument('--skip-baselines', action='store_true',
-                        help='Skip SGD/ADAM/ADAGRAD runs')
-    parser.add_argument('--skip-sensitivity', action='store_true',
-                        help='Skip (alpha,beta) sensitivity study')
-    parser.add_argument('--skip-decay-study', action='store_true',
-                        help='Skip step-size decay exponent study')
-    parser.add_argument('--skip-sina', action='store_true',
-                        help='Skip SINA experiments')
-    parser.add_argument('--output-dir', type=str, default='results',
-                        help='Directory to save results')
-    parser.add_argument('--compile', action='store_true',
-                        help='Use torch.compile for speed (requires PyTorch 2+)')
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="SINA/INNA Experiments")
+    p.add_argument('--phases', nargs='+', type=int, default=[1, 2],
+                   choices=[1, 2], help='Phases to run (default: 1 2)')
+    p.add_argument('--datasets', nargs='+',
+                   default=['MNIST', 'CIFAR10', 'CIFAR100'],
+                   choices=['MNIST', 'CIFAR10', 'CIFAR100'])
+    p.add_argument('--full-epochs', type=int, default=200)
+    p.add_argument('--search-epochs', type=int, default=15)
+    p.add_argument('--num-seeds', type=int, default=5)
+    p.add_argument('--batch-size', type=int, default=32,
+                   help='Batch size (default: 32, matching INNA paper)')
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--output-dir', type=str, default='results')
+    p.add_argument('--compile', action='store_true',
+                   help='Use torch.compile (PyTorch 2+)')
+    return p.parse_args()
 
 
 # ============================================================
-# 1. NETWORK ARCHITECTURE — Network in Network (NiN)
+# 1. NETWORK ARCHITECTURE - Network in Network (NiN)
 # ============================================================
-# Matches the INNA paper Section 5.2.1: "a slightly modified version of the
-# popular Network in Network (NiN) (Lin et al., 2014). It is a reasonably
-# large convolutional network with P ~ 10^6 parameters. We use ReLU
-# activation functions."
-#
-# For SINA: the forward pass takes an eps argument; when eps > 0, we replace
-# ReLU with the Zang smoothing function P_{rho_Z}(t, eps).
-
 class NiNBlock(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0):
+    def __init__(self, in_planes, out_planes, kernel_size,
+                 stride=1, padding=0):
         super().__init__()
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding)
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size,
+                              stride, padding)
         self.bn = nn.BatchNorm2d(out_planes)
 
     def forward(self, x, act_fn):
@@ -111,54 +94,35 @@ class NiNBlock(nn.Module):
 
 
 class NiNNet(nn.Module):
-    """Network in Network for image classification.
-
-    Architecture: 3 blocks of (Conv -> 1x1Conv -> 1x1Conv -> Pool),
-    followed by global average pooling.
-    """
     def __init__(self, in_channels=3, num_classes=10):
         super().__init__()
-        # Block 1
-        self.block1_conv  = NiNBlock(in_channels, 192, kernel_size=5, padding=2)
-        self.block1_cccp1 = NiNBlock(192, 160, kernel_size=1)
-        self.block1_cccp2 = NiNBlock(160, 96, kernel_size=1)
-        self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.block1_conv  = NiNBlock(in_channels, 192, 5, padding=2)
+        self.block1_cccp1 = NiNBlock(192, 160, 1)
+        self.block1_cccp2 = NiNBlock(160, 96, 1)
+        self.pool1 = nn.MaxPool2d(3, stride=2, padding=1)
 
-        # Block 2
-        self.block2_conv  = NiNBlock(96, 192, kernel_size=5, padding=2)
-        self.block2_cccp3 = NiNBlock(192, 192, kernel_size=1)
-        self.block2_cccp4 = NiNBlock(192, 192, kernel_size=1)
-        self.pool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.block2_conv  = NiNBlock(96, 192, 5, padding=2)
+        self.block2_cccp3 = NiNBlock(192, 192, 1)
+        self.block2_cccp4 = NiNBlock(192, 192, 1)
+        self.pool2 = nn.MaxPool2d(3, stride=2, padding=1)
 
-        # Block 3
-        self.block3_conv  = NiNBlock(192, 192, kernel_size=3, padding=1)
-        self.block3_cccp5 = NiNBlock(192, 192, kernel_size=1)
-        self.block3_cccp6 = nn.Conv2d(192, num_classes, kernel_size=1)
+        self.block3_conv  = NiNBlock(192, 192, 3, padding=1)
+        self.block3_cccp5 = NiNBlock(192, 192, 1)
+        self.block3_cccp6 = nn.Conv2d(192, num_classes, 1)
         self.pool3 = nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self, x, eps=None):
-        if eps is not None and eps > 0.0:
-            act = lambda z: zang_plus(z, eps)
-        else:
-            act = F.relu
+        act = F.relu if (eps is None or eps <= 0.0) else \
+              lambda z: zang_plus(z, eps)
 
-        x = self.block1_conv(x, act)
-        x = self.block1_cccp1(x, act)
-        x = self.block1_cccp2(x, act)
-        x = self.pool1(x)
-
-        x = self.block2_conv(x, act)
-        x = self.block2_cccp3(x, act)
-        x = self.block2_cccp4(x, act)
-        x = self.pool2(x)
-
-        x = self.block3_conv(x, act)
-        x = self.block3_cccp5(x, act)
-        x = self.block3_cccp6(x)
-
+        x = self.pool1(self.block1_cccp2(
+            self.block1_cccp1(self.block1_conv(x, act), act), act))
+        x = self.pool2(self.block2_cccp4(
+            self.block2_cccp3(self.block2_conv(x, act), act), act))
+        x = self.block3_cccp6(
+            self.block3_cccp5(self.block3_conv(x, act), act))
         x = self.pool3(x)
-        x = x.view(x.size(0), -1)
-        return x
+        return x.view(x.size(0), -1)
 
 
 # ============================================================
@@ -166,51 +130,46 @@ class NiNNet(nn.Module):
 # ============================================================
 def get_loaders(dataset_name, batch_size, num_workers=4):
     if dataset_name == 'MNIST':
-        transform = transforms.Compose([
+        tf = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,)),
         ])
         trainset = torchvision.datasets.MNIST(
-            root='./data', train=True, download=True, transform=transform)
+            root='./data', train=True, download=True, transform=tf)
         testset = torchvision.datasets.MNIST(
-            root='./data', train=False, download=True, transform=transform)
-        in_channels, num_classes = 1, 10
+            root='./data', train=False, download=True, transform=tf)
+        in_ch, n_cls = 1, 10
     else:
-        # INNA paper uses simple normalization, no aggressive augmentation
         stats = ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        transform_train = transforms.Compose([
+        tf_train = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(*stats),
         ])
-        transform_test = transforms.Compose([
+        tf_test = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(*stats),
         ])
-
         if dataset_name == 'CIFAR10':
             trainset = torchvision.datasets.CIFAR10(
-                root='./data', train=True, download=True, transform=transform_train)
+                root='./data', train=True, download=True, transform=tf_train)
             testset = torchvision.datasets.CIFAR10(
-                root='./data', train=False, download=True, transform=transform_test)
-            in_channels, num_classes = 3, 10
-        elif dataset_name == 'CIFAR100':
-            trainset = torchvision.datasets.CIFAR100(
-                root='./data', train=True, download=True, transform=transform_train)
-            testset = torchvision.datasets.CIFAR100(
-                root='./data', train=False, download=True, transform=transform_test)
-            in_channels, num_classes = 3, 100
+                root='./data', train=False, download=True, transform=tf_test)
+            in_ch, n_cls = 3, 10
         else:
-            raise ValueError(f"Unknown dataset: {dataset_name}")
+            trainset = torchvision.datasets.CIFAR100(
+                root='./data', train=True, download=True, transform=tf_train)
+            testset = torchvision.datasets.CIFAR100(
+                root='./data', train=False, download=True, transform=tf_test)
+            in_ch, n_cls = 3, 100
 
-    trainloader = torch.utils.data.DataLoader(
+    train_loader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True)
-    testloader = torch.utils.data.DataLoader(
+    test_loader = torch.utils.data.DataLoader(
         testset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True, drop_last=False)
-
-    return trainloader, testloader, in_channels, num_classes
+    return train_loader, test_loader, in_ch, n_cls
 
 
 # ============================================================
@@ -219,78 +178,100 @@ def get_loaders(dataset_name, batch_size, num_workers=4):
 @torch.no_grad()
 def evaluate(model, loader, device, eps=None):
     model.eval()
-    correct = 0
-    total = 0
+    correct = total = 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         out = model(x, eps=eps)
-        _, pred = out.max(1)
+        correct += (out.argmax(1) == y).sum().item()
         total += y.size(0)
-        correct += (pred == y).sum().item()
     model.train()
     return correct / total
 
 
 # ============================================================
-# 4. TRAINING ROUTINES
+# 4. RESULT CACHING
+# ============================================================
+def _cache_path(output_dir, key):
+    return os.path.join(output_dir, f"{key}.json")
+
+
+def result_exists(output_dir, key):
+    return os.path.exists(_cache_path(output_dir, key))
+
+
+def save_result(output_dir, key, data):
+    os.makedirs(output_dir, exist_ok=True)
+    with open(_cache_path(output_dir, key), 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"  [Saved {key}]")
+
+
+def load_result(output_dir, key):
+    with open(_cache_path(output_dir, key), 'r') as f:
+        d = json.load(f)
+    # Convert lists back to numpy
+    for k in ('accuracy', 'loss', 'accuracy_relu', 'epsilon'):
+        if k in d and d[k] is not None:
+            d[k] = np.array(d[k])
+    return d
+
+
+def _to_list(x):
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return x
+
+
+# ============================================================
+# 5. TRAINING ROUTINES
 # ============================================================
 
-# ---- 4a. INNA Training ----
+# ---- 5a. INNA ----
 def train_inna(device, epochs, dataset, alpha, beta, lr, decaypower=0.5,
-               batch_size=32, num_workers=4, use_compile=False):
-    """Train NiN with the INNA optimizer.
+               batch_size=32, num_workers=4, use_compile=False, seed=0):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    Step-size schedule: gamma_k = lr / (k+1)^decaypower, per iteration.
-    This matches the INNA paper's Assumption 1.
-    """
-    train_l, test_l, in_c, n_cls = get_loaders(dataset, batch_size, num_workers)
-    model = NiNNet(in_channels=in_c, num_classes=n_cls).to(device)
+    train_l, test_l, in_ch, n_cls = get_loaders(dataset, batch_size, num_workers)
+    model = NiNNet(in_channels=in_ch, num_classes=n_cls).to(device)
     opt = INNAOptimizer(model.parameters(), lr=lr, alpha=alpha, beta=beta,
                         decaypower=decaypower)
     crit = nn.CrossEntropyLoss()
-
     if use_compile:
         model = torch.compile(model)
 
     acc_hist, loss_hist = [], []
-
     for ep in range(epochs):
-        epoch_loss = 0.0
-        num_batches = 0
+        epoch_loss = n_batch = 0
         model.train()
         for x, y in train_l:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            out = model(x, eps=None)  # INNA uses standard ReLU
-            loss = crit(out, y)
+            loss = crit(model(x), y)
             loss.backward()
             opt.step()
             epoch_loss += loss.item()
-            num_batches += 1
+            n_batch += 1
 
-        acc = evaluate(model, test_l, device, eps=None)
+        acc = evaluate(model, test_l, device)
         acc_hist.append(acc)
-        loss_hist.append(epoch_loss / num_batches)
+        loss_hist.append(epoch_loss / n_batch)
 
-        if (ep + 1) % 10 == 0:
-            print(f"    INNA(a={alpha},b={beta}) Ep {ep+1}: "
+        if (ep + 1) % 20 == 0:
+            print(f"      [seed {seed}] INNA Ep {ep+1}: "
                   f"Acc={acc:.4f} Loss={loss_hist[-1]:.4f}")
 
     return acc_hist, loss_hist
 
 
-# ---- 4b. Baseline Training (SGD, ADAM, ADAGRAD) ----
+# ---- 5b. Baselines (SGD, ADAM, ADAGRAD) ----
 def train_baseline(device, epochs, dataset, opt_name, lr, decaypower=0.5,
-                   batch_size=32, num_workers=4, use_compile=False):
-    """Train NiN with a standard optimizer.
+                   batch_size=32, num_workers=4, use_compile=False, seed=0):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    For SGD: uses the same gamma_k = lr/(k+1)^decaypower schedule as INNA,
-             implemented via a LambdaLR scheduler stepping per iteration.
-    For ADAM/ADAGRAD: uses their built-in adaptive rates, no external schedule.
-    This matches the INNA paper Section 5.2.1.
-    """
-    train_l, test_l, in_c, n_cls = get_loaders(dataset, batch_size, num_workers)
-    model = NiNNet(in_channels=in_c, num_classes=n_cls).to(device)
+    train_l, test_l, in_ch, n_cls = get_loaders(dataset, batch_size, num_workers)
+    model = NiNNet(in_channels=in_ch, num_classes=n_cls).to(device)
     crit = nn.CrossEntropyLoss()
 
     if opt_name == 'SGD':
@@ -302,78 +283,59 @@ def train_baseline(device, epochs, dataset, opt_name, lr, decaypower=0.5,
     else:
         raise ValueError(f"Unknown optimizer: {opt_name}")
 
-    # For SGD: apply the same decaying step-size schedule as INNA per iteration.
-    # For ADAM/ADAGRAD: the INNA paper says they "use an adaptive procedure
-    # based on past gradients" — no external schedule.
+    # SGD uses same per-iteration decay as INNA; ADAM/ADAGRAD use their own
+    scheduler = None
     if opt_name == 'SGD' and decaypower > 0:
-        # gamma_k = lr / (k+1)^q, where k is the iteration count.
-        # LambdaLR: new_lr = lr * lambda(step)
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             opt, lr_lambda=lambda step: 1.0 / ((step + 1) ** decaypower))
-    else:
-        scheduler = None
 
     if use_compile:
         model = torch.compile(model)
 
     acc_hist, loss_hist = [], []
-
     for ep in range(epochs):
-        epoch_loss = 0.0
-        num_batches = 0
+        epoch_loss = n_batch = 0
         model.train()
         for x, y in train_l:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            out = model(x, eps=None)
-            loss = crit(out, y)
+            loss = crit(model(x), y)
             loss.backward()
             opt.step()
             if scheduler is not None:
                 scheduler.step()
             epoch_loss += loss.item()
-            num_batches += 1
+            n_batch += 1
 
-        acc = evaluate(model, test_l, device, eps=None)
+        acc = evaluate(model, test_l, device)
         acc_hist.append(acc)
-        loss_hist.append(epoch_loss / num_batches)
+        loss_hist.append(epoch_loss / n_batch)
 
-        if (ep + 1) % 10 == 0:
-            print(f"    {opt_name} Ep {ep+1}: Acc={acc:.4f} Loss={loss_hist[-1]:.4f}")
+        if (ep + 1) % 20 == 0:
+            print(f"      [seed {seed}] {opt_name} Ep {ep+1}: "
+                  f"Acc={acc:.4f} Loss={loss_hist[-1]:.4f}")
 
     return acc_hist, loss_hist
 
 
-# ---- 4c. SINA Training (Algorithm 4.1 with adaptive epsilon) ----
+# ---- 5c. SINA (Algorithm 4.1 with adaptive epsilon) ----
 def train_sina(device, epochs, dataset, alpha, beta, gamma, eps0,
                sigma=0.5, delta=1.0, batch_size=32, num_workers=4,
-               use_compile=False, prune=False, init_phi_from_grad=True):
-    """Train NiN with the SINA algorithm (Algorithm 4.1).
+               use_compile=False, seed=0, init_phi_from_grad=True):
+    """Train with SINA. Returns 4-tuple: (acc_smoothed, acc_relu, loss, eps)."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    Key properties matching the paper:
-      - gamma is CONSTANT (Assumption 2(iii): lim inf gamma_k > 0)
-      - epsilon is adapted via Step 4 gradient-norm criterion
-      - phi_0 optionally initialized from -grad S(theta_0, eps_0)
-
-    Args:
-        gamma: constant step size (must satisfy 0 < gamma <= min{beta, 1/alpha, alpha/L})
-        eps0: initial smoothing parameter
-        sigma: eps reduction factor (0 < sigma < 1)
-        delta: gradient-norm threshold (delta > 0)
-        init_phi_from_grad: if True, do one forward/backward to init phi_0
-    """
-    train_l, test_l, in_c, n_cls = get_loaders(dataset, batch_size, num_workers)
-    model = NiNNet(in_channels=in_c, num_classes=n_cls).to(device)
+    train_l, test_l, in_ch, n_cls = get_loaders(dataset, batch_size, num_workers)
+    model = NiNNet(in_channels=in_ch, num_classes=n_cls).to(device)
     crit = nn.CrossEntropyLoss()
 
-    # ---- Initialize phi ----
+    # Initialize phi
     if init_phi_from_grad:
-        # Do one forward/backward pass to get initial gradients
         model.train()
         x0, y0 = next(iter(train_l))
         x0, y0 = x0.to(device), y0.to(device)
-        out0 = model(x0, eps=eps0)
-        loss0 = crit(out0, y0)
+        loss0 = crit(model(x0, eps=eps0), y0)
         loss0.backward()
         phi = initialize_phi_from_grad(model)
         model.zero_grad(set_to_none=True)
@@ -385,18 +347,17 @@ def train_sina(device, epochs, dataset, alpha, beta, gamma, eps0,
     if use_compile:
         model = torch.compile(model)
 
-    acc_hist, loss_hist, eps_hist = [], [], []
+    acc_smooth_hist, acc_relu_hist, loss_hist, eps_hist = [], [], [], []
 
     for ep in range(epochs):
-        epoch_loss = 0.0
-        num_batches = 0
+        epoch_loss = n_batch = 0
         model.train()
 
         for x, y in train_l:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             model.zero_grad(set_to_none=True)
 
-            # Step 2: Compute gradient g_k = grad_theta S(theta_k, eps_k)
+            # Step 2: gradient of smoothed loss
             out = model(x, eps=eps_current)
             loss = crit(out, y)
             loss.backward()
@@ -405,176 +366,156 @@ def train_sina(device, epochs, dataset, alpha, beta, gamma, eps0,
             sina_step_fn(model, phi, alpha, beta, gamma)
 
             epoch_loss += loss.item()
-            num_batches += 1
+            n_batch += 1
 
-        # ---- Step 4: Adaptive epsilon update ----
-        # We need ||grad S(theta_{k+1}, eps_k)||. Do one forward/backward
-        # on a representative batch with the NEW theta and current eps.
+        # Step 4: adaptive epsilon - check gradient norm on a batch
         model.zero_grad(set_to_none=True)
-        x_check, y_check = next(iter(train_l))
-        x_check = x_check.to(device, non_blocking=True)
-        y_check = y_check.to(device, non_blocking=True)
-        out_check = model(x_check, eps=eps_current)
-        loss_check = crit(out_check, y_check)
-        loss_check.backward()
-        post_grad_norm = compute_grad_norm(model)
+        x_chk, y_chk = next(iter(train_l))
+        x_chk, y_chk = x_chk.to(device, non_blocking=True), \
+                        y_chk.to(device, non_blocking=True)
+        loss_chk = crit(model(x_chk, eps=eps_current), y_chk)
+        loss_chk.backward()
+        grad_norm = compute_grad_norm(model)
         model.zero_grad(set_to_none=True)
 
-        eps_current = sina_update_epsilon(
-            post_grad_norm, eps_current, delta, sigma)
-
+        eps_current = sina_update_epsilon(grad_norm, eps_current, delta, sigma)
         eps_hist.append(eps_current)
-        acc = evaluate(model, test_l, device, eps=eps_current)
-        acc_hist.append(acc)
-        loss_hist.append(epoch_loss / num_batches)
 
-        if prune and (np.isnan(acc) or acc < 0.10):
-            return acc_hist, loss_hist, eps_hist
+        # Dual evaluation: smoothed AND ReLU (eps=0)
+        acc_smooth = evaluate(model, test_l, device, eps=eps_current)
+        acc_relu = evaluate(model, test_l, device, eps=0)
+        acc_smooth_hist.append(acc_smooth)
+        acc_relu_hist.append(acc_relu)
+        loss_hist.append(epoch_loss / n_batch)
 
-        if (ep + 1) % 10 == 0:
-            print(f"    SINA Ep {ep+1}: Acc={acc:.4f} Loss={loss_hist[-1]:.4f} "
-                  f"eps={eps_current:.6f}")
+        if (ep + 1) % 20 == 0:
+            print(f"      [seed {seed}] SINA Ep {ep+1}: "
+                  f"Acc(smooth)={acc_smooth:.4f} Acc(relu)={acc_relu:.4f} "
+                  f"Loss={loss_hist[-1]:.4f} eps={eps_current:.6f}")
 
-    return acc_hist, loss_hist, eps_hist
+    return acc_smooth_hist, acc_relu_hist, loss_hist, eps_hist
 
 
 # ============================================================
-# 5. GAMMA_0 GRID SEARCH
+# 6. GAMMA_0 GRID SEARCH
 # ============================================================
-# INNA paper Section 5.2.1: "for each algorithm we select the initial
-# step-size that most decreases the training error J after fifteen epochs"
+def grid_search_gamma0(device, dataset, optimizer_type, search_epochs,
+                       batch_size, num_workers, extra_kwargs=None):
+    """Find gamma_0 minimizing training loss after search_epochs.
 
-GAMMA0_GRID = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
-
-def grid_search_lr(device, dataset, train_fn, search_epochs, batch_size,
-                   num_workers, extra_kwargs=None):
-    """Find gamma_0 that minimizes training loss after search_epochs.
-
-    Args:
-        train_fn: one of train_inna, train_baseline, train_sina
-        extra_kwargs: dict of additional kwargs for train_fn (e.g. alpha, beta)
-
-    Returns:
-        best_lr (float)
+    optimizer_type: 'inna', 'sgd', 'adam', 'adagrad', 'sina'
+    Returns: (best_gamma0, search_log)
     """
     if extra_kwargs is None:
         extra_kwargs = {}
-
     best_lr = GAMMA0_GRID[0]
     best_loss = float('inf')
+    log = []
 
-    print(f"    Grid search over gamma_0: {GAMMA0_GRID}")
+    print(f"    Grid search gamma_0 for {optimizer_type.upper()}: {GAMMA0_GRID}")
     for lr in GAMMA0_GRID:
         try:
-            result = train_fn(device, search_epochs, dataset, lr=lr,
-                              batch_size=batch_size, num_workers=num_workers,
-                              **extra_kwargs)
-            # train_fn returns (acc_hist, loss_hist) or (acc_hist, loss_hist, eps_hist)
-            if isinstance(result, tuple) and len(result) >= 2:
-                loss_hist = result[1]
-            else:
-                continue
-
-            final_loss = loss_hist[-1] if loss_hist else float('inf')
+            if optimizer_type == 'inna':
+                _, loss_h = train_inna(
+                    device, search_epochs, dataset, lr=lr,
+                    batch_size=batch_size, num_workers=num_workers,
+                    seed=0, **extra_kwargs)
+                final_loss = loss_h[-1]
+            elif optimizer_type == 'sina':
+                _, _, loss_h, _ = train_sina(
+                    device, search_epochs, dataset, gamma=lr,
+                    batch_size=batch_size, num_workers=num_workers,
+                    seed=0, **extra_kwargs)
+                final_loss = loss_h[-1]
+            else:  # sgd, adam, adagrad
+                _, loss_h = train_baseline(
+                    device, search_epochs, dataset,
+                    opt_name=optimizer_type.upper(), lr=lr,
+                    batch_size=batch_size, num_workers=num_workers,
+                    seed=0, **extra_kwargs)
+                final_loss = loss_h[-1]
 
             if np.isfinite(final_loss) and final_loss < best_loss:
                 best_loss = final_loss
                 best_lr = lr
 
-            print(f"      gamma_0={lr:.4f} -> train_loss={final_loss:.4f}")
+            log.append((lr, final_loss))
+            print(f"      gamma_0={lr:.4f} -> loss={final_loss:.4f}")
         except Exception as e:
+            log.append((lr, float('inf')))
             print(f"      gamma_0={lr:.4f} -> FAILED: {e}")
 
-    print(f"    Best gamma_0 = {best_lr} (loss={best_loss:.4f})")
-    return best_lr
+    print(f"    => Best gamma_0={best_lr} (loss={best_loss:.4f})")
+    return best_lr, log
 
 
 # ============================================================
-# 6. MULTI-SEED RUNNERS
+# 7. MULTI-SEED RUNNER
 # ============================================================
-def run_multi_seed(train_fn, device, dataset, num_seeds, epochs,
-                   batch_size, num_workers, method_label, extra_kwargs=None,
-                   use_compile=False):
-    """Run a training function across multiple seeds and collect results."""
-    if extra_kwargs is None:
-        extra_kwargs = {}
-
-    print(f"  > Running {method_label} ({num_seeds} seeds, {epochs} epochs)...")
-    all_accs, all_losses, all_eps = [], [], []
-
-    for s in range(num_seeds):
-        torch.manual_seed(s)
-        np.random.seed(s)
-        result = train_fn(device, epochs, dataset,
-                          batch_size=batch_size, num_workers=num_workers,
-                          use_compile=use_compile, **extra_kwargs)
-
-        if len(result) == 3:
-            a, l, e = result
-            all_eps.append(e)
-        else:
-            a, l = result
-
-        all_accs.append(a)
-        all_losses.append(l)
-
-    acc_np = np.array(all_accs)
-    loss_np = np.array(all_losses)
-    eps_np = np.array(all_eps[0]) if all_eps else None
-
-    return acc_np, loss_np, eps_np
+def run_multi_seed_inna(device, dataset, seeds, epochs, batch_size,
+                        num_workers, use_compile, label, **train_kwargs):
+    print(f"  > {label} ({len(seeds)} seeds, {epochs} epochs)...")
+    all_acc, all_loss = [], []
+    for s in seeds:
+        a, l = train_inna(device, epochs, dataset, batch_size=batch_size,
+                          num_workers=num_workers, use_compile=use_compile,
+                          seed=s, **train_kwargs)
+        all_acc.append(a)
+        all_loss.append(l)
+    return {'accuracy': np.array(all_acc), 'loss': np.array(all_loss)}
 
 
-# ============================================================
-# 7. SAVE / LOAD RESULTS
-# ============================================================
-def save_results(output_dir, dataset, method_name, acc_np, loss_np, eps_np=None):
-    os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"data_{dataset}_{method_name}.json")
-    data = {
-        "dataset": dataset,
-        "method": method_name,
-        "epochs": int(acc_np.shape[1]) if acc_np.ndim > 1 else len(acc_np),
-        "seeds": int(acc_np.shape[0]) if acc_np.ndim > 1 else 1,
-        "accuracy": acc_np.tolist(),
-        "loss": loss_np.tolist(),
-        "epsilon": eps_np.tolist() if eps_np is not None else None,
+def run_multi_seed_baseline(device, dataset, seeds, epochs, batch_size,
+                            num_workers, use_compile, label, **train_kwargs):
+    print(f"  > {label} ({len(seeds)} seeds, {epochs} epochs)...")
+    all_acc, all_loss = [], []
+    for s in seeds:
+        a, l = train_baseline(device, epochs, dataset, batch_size=batch_size,
+                              num_workers=num_workers, use_compile=use_compile,
+                              seed=s, **train_kwargs)
+        all_acc.append(a)
+        all_loss.append(l)
+    return {'accuracy': np.array(all_acc), 'loss': np.array(all_loss)}
+
+
+def run_multi_seed_sina(device, dataset, seeds, epochs, batch_size,
+                        num_workers, use_compile, label, **train_kwargs):
+    print(f"  > {label} ({len(seeds)} seeds, {epochs} epochs)...")
+    all_acc_s, all_acc_r, all_loss, all_eps = [], [], [], []
+    for s in seeds:
+        a_s, a_r, l, e = train_sina(
+            device, epochs, dataset, batch_size=batch_size,
+            num_workers=num_workers, use_compile=use_compile,
+            seed=s, **train_kwargs)
+        all_acc_s.append(a_s)
+        all_acc_r.append(a_r)
+        all_loss.append(l)
+        all_eps.append(e)
+    return {
+        'accuracy': np.array(all_acc_s),
+        'accuracy_relu': np.array(all_acc_r),
+        'loss': np.array(all_loss),
+        'epsilon': np.array(all_eps),
     }
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"  [Saved {filename}]")
-
-
-def load_results(output_dir, dataset, method_name):
-    filename = os.path.join(output_dir, f"data_{dataset}_{method_name}.json")
-    if not os.path.exists(filename):
-        return None
-    with open(filename, 'r') as f:
-        d = json.load(f)
-    acc = np.array(d['accuracy'])
-    loss = np.array(d['loss'])
-    eps = np.array(d['epsilon']) if d.get('epsilon') is not None else None
-    return acc, loss, eps
 
 
 # ============================================================
-# 8. PLOTTING — matches INNA paper format
+# 8. PLOTTING - matches INNA paper style
 # ============================================================
 # INNA paper: "solid lines represent mean values and pale surfaces
-# represent the best and worst runs" — min/max shading, not std.
+# represent the best and worst runs" → min/max shading
 
 COLORS = {
-    'INNA_(0.1,0.1)': '#1f77b4',    # blue
-    'INNA_(0.5,0.1)': '#2ca02c',    # green
-    'INNA_(0.5,0.5)': '#17becf',    # cyan
-    'INNA_(0.5,1.0)': '#9467bd',    # purple
-    'INNA':           '#2ca02c',    # green (default INNA config)
-    'SGD':            '#d62728',    # red
-    'ADAM':           '#ff7f0e',    # orange
-    'ADAGRAD':        '#e377c2',    # pink
-    'SINA':           '#1f77b4',    # blue
-    'SINA_Grid':      '#1f77b4',    # blue
-    'SINA_Bayes':     '#17becf',    # cyan
+    'INNA_(0.1,0.1)': '#1f77b4',
+    'INNA_(0.5,0.1)': '#2ca02c',
+    'INNA_(0.5,0.5)': '#17becf',
+    'INNA_(0.5,1.0)': '#9467bd',
+    'INNA':           '#2ca02c',
+    'SGD':            '#d62728',
+    'ADAM':           '#ff7f0e',
+    'ADAGRAD':        '#e377c2',
+    'SINA':           '#1f77b4',
+    'SINA (relu)':    '#8c564b',
 }
 
 LINESTYLES = {
@@ -587,8 +528,7 @@ LINESTYLES = {
     'ADAM':           '-',
     'ADAGRAD':        '-',
     'SINA':           '-',
-    'SINA_Grid':      '--',
-    'SINA_Bayes':     '-',
+    'SINA (relu)':    '--',
 }
 
 MARKERS = {
@@ -599,492 +539,489 @@ MARKERS = {
 }
 
 
-def shade_plot(ax, epochs, data, label, color, linestyle='-', marker=None):
-    """Plot mean line with min/max shading (matching INNA paper)."""
+def _shade(ax, epochs, data, label, color, ls='-', marker=None):
+    """Mean line with min/max shading."""
     mean = np.mean(data, axis=0)
     lo = np.min(data, axis=0)
     hi = np.max(data, axis=0)
-
-    marker_every = max(1, len(epochs) // 8)  # ~8 markers across plot
+    me = max(1, len(epochs) // 8)
     ax.plot(epochs, mean, label=label, color=color, linewidth=2,
-            linestyle=linestyle, marker=marker, markevery=marker_every,
-            markersize=6)
+            linestyle=ls, marker=marker, markevery=me, markersize=5)
     ax.fill_between(epochs, lo, hi, color=color, alpha=0.15)
 
 
-def plot_figure2(output_dir, dataset, results_dict, full_epochs):
-    """Reproduce INNA paper Figure 2: (alpha,beta) sensitivity.
-
-    Top row: log10(training loss) vs epochs
-    Bottom row: test accuracy vs epochs
-    """
+def plot_figure2(output_dir, dataset, results, full_epochs):
+    """INNA (alpha,beta) sensitivity - top: log loss, bottom: accuracy."""
     epochs = np.arange(1, full_epochs + 1)
+    fig, (ax_l, ax_a) = plt.subplots(2, 1, figsize=(8, 10))
 
-    fig, (ax_loss, ax_acc) = plt.subplots(2, 1, figsize=(8, 10))
-
-    for label, (acc, loss, _) in sorted(results_dict.items()):
-        color = COLORS.get(label, 'gray')
+    for label in sorted(results):
+        r = results[label]
+        c = COLORS.get(label, 'gray')
         ls = LINESTYLES.get(label, '-')
         mk = MARKERS.get(label, None)
+        _shade(ax_l, epochs, np.log10(np.clip(r['loss'], 1e-10, None)),
+               label, c, ls, mk)
+        _shade(ax_a, epochs, r['accuracy'], label, c, ls, mk)
 
-        # Training loss in log scale
-        log_loss = np.log10(np.clip(loss, 1e-10, None))
-        shade_plot(ax_loss, epochs, log_loss, label, color, ls, mk)
-
-        # Test accuracy
-        shade_plot(ax_acc, epochs, acc, label, color, ls, mk)
-
-    ax_loss.set_ylabel(r'Training $\log_{10}(\mathcal{J}(\theta))$')
-    ax_loss.set_xlabel('Epochs')
-    ax_loss.set_title(f'{dataset} — INNA Hyperparameter Sensitivity')
-    ax_loss.legend(fontsize=8)
-    ax_loss.grid(True, alpha=0.3)
-
-    ax_acc.set_ylabel('Test Accuracy')
-    ax_acc.set_xlabel('Epochs')
-    ax_acc.legend(fontsize=8)
-    ax_acc.grid(True, alpha=0.3)
-
+    ax_l.set_ylabel(r'$\log_{10}(\mathcal{J}(\theta))$')
+    ax_l.set_xlabel('Epochs')
+    ax_l.set_title(f'{dataset} - INNA Hyperparameter Sensitivity')
+    ax_l.legend(fontsize=8)
+    ax_l.grid(True, alpha=0.3)
+    ax_a.set_ylabel('Test Accuracy')
+    ax_a.set_xlabel('Epochs')
+    ax_a.legend(fontsize=8)
+    ax_a.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'fig2_sensitivity_{dataset}.png'), dpi=150)
+    plt.savefig(os.path.join(output_dir, f'fig2_sensitivity_{dataset}.png'),
+                dpi=150)
     plt.close()
 
 
-def plot_figure3(output_dir, dataset, results_dict, full_epochs):
-    """Reproduce INNA paper Figure 3: INNA vs SGD vs ADAM vs ADAGRAD.
-
-    Top: log10(training loss), Bottom: test accuracy.
-    """
+def plot_figure3(output_dir, dataset, results, full_epochs):
+    """INNA vs SGD vs ADAM vs ADAGRAD."""
     epochs = np.arange(1, full_epochs + 1)
-    fig, (ax_loss, ax_acc) = plt.subplots(2, 1, figsize=(8, 10))
+    fig, (ax_l, ax_a) = plt.subplots(2, 1, figsize=(8, 10))
 
-    for label, (acc, loss, _) in sorted(results_dict.items()):
-        color = COLORS.get(label, 'gray')
+    for label in sorted(results):
+        r = results[label]
+        c = COLORS.get(label, 'gray')
         ls = LINESTYLES.get(label, '-')
         mk = MARKERS.get(label, None)
+        _shade(ax_l, epochs, np.log10(np.clip(r['loss'], 1e-10, None)),
+               label, c, ls, mk)
+        _shade(ax_a, epochs, r['accuracy'], label, c, ls, mk)
 
-        log_loss = np.log10(np.clip(loss, 1e-10, None))
-        shade_plot(ax_loss, epochs, log_loss, label, color, ls, mk)
-        shade_plot(ax_acc, epochs, acc, label, color, ls, mk)
-
-    ax_loss.set_ylabel(r'Training $\log_{10}(\mathcal{J}(\theta))$')
-    ax_loss.set_xlabel('Epochs')
-    ax_loss.set_title(f'{dataset} — INNA vs State-of-the-Art')
-    ax_loss.legend(fontsize=8)
-    ax_loss.grid(True, alpha=0.3)
-
-    ax_acc.set_ylabel('Test Accuracy')
-    ax_acc.set_xlabel('Epochs')
-    ax_acc.legend(fontsize=8)
-    ax_acc.grid(True, alpha=0.3)
-
+    ax_l.set_ylabel(r'$\log_{10}(\mathcal{J}(\theta))$')
+    ax_l.set_xlabel('Epochs')
+    ax_l.set_title(f'{dataset} - INNA vs State-of-the-Art')
+    ax_l.legend(fontsize=8)
+    ax_l.grid(True, alpha=0.3)
+    ax_a.set_ylabel('Test Accuracy')
+    ax_a.set_xlabel('Epochs')
+    ax_a.legend(fontsize=8)
+    ax_a.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'fig3_comparison_{dataset}.png'), dpi=150)
+    plt.savefig(os.path.join(output_dir, f'fig3_comparison_{dataset}.png'),
+                dpi=150)
     plt.close()
 
 
-def plot_figure4(output_dir, dataset, results_dict, full_epochs):
-    """Reproduce INNA paper Figure 4: step-size decay exponent comparison.
-
-    Top: training loss for various q values.
-    Bottom: best INNA (q=1/4) vs ADAM.
-    """
+def plot_figure4(output_dir, dataset, results, full_epochs):
+    """Step-size decay exponents + best INNA vs ADAM."""
     epochs = np.arange(1, full_epochs + 1)
 
     decay_colors = {
-        'INNA_q=0.500': '#1f77b4',
-        'INNA_q=0.250': '#d62728',
-        'INNA_q=0.125': '#ff7f0e',
+        'INNA_q=0.500':  '#1f77b4',
+        'INNA_q=0.250':  '#d62728',
+        'INNA_q=0.125':  '#ff7f0e',
         'INNA_q=0.0625': '#9467bd',
     }
     decay_styles = {
-        'INNA_q=0.500': '--',
-        'INNA_q=0.250': '-',
-        'INNA_q=0.125': ':',
+        'INNA_q=0.500':  '--',
+        'INNA_q=0.250':  '-',
+        'INNA_q=0.125':  ':',
         'INNA_q=0.0625': '-.',
     }
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 10))
 
     # Top: all decay exponents
-    for label, (acc, loss, _) in sorted(results_dict.items()):
+    for label in sorted(results):
         if label.startswith('INNA_q='):
-            color = decay_colors.get(label, 'gray')
+            r = results[label]
+            c = decay_colors.get(label, 'gray')
             ls = decay_styles.get(label, '-')
-            q_val = label.split('=')[1]
-            log_loss = np.log10(np.clip(loss, 1e-10, None))
-            shade_plot(ax_top, epochs, log_loss, f'$k^{{-{q_val}}}$',
-                       color, ls)
+            q_str = label.split('=')[1]
+            _shade(ax_top, epochs,
+                   np.log10(np.clip(r['loss'], 1e-10, None)),
+                   fr'$k^{{-{q_str}}}$', c, ls)
 
-    ax_top.set_ylabel(r'Training $\log_{10}(\mathcal{J}(\theta))$')
+    ax_top.set_ylabel(r'$\log_{10}(\mathcal{J}(\theta))$')
     ax_top.set_xlabel('Epochs')
-    ax_top.set_title(f'{dataset} — Step-size Decay Comparison')
+    ax_top.set_title(f'{dataset} - Step-size Decay Comparison')
     ax_top.legend(fontsize=8)
     ax_top.grid(True, alpha=0.3)
 
-    # Bottom: best INNA decay vs ADAM
-    best_inna_key = 'INNA_q=0.250'  # paper shows q=1/4 is best
-    if best_inna_key in results_dict:
-        acc, loss, _ = results_dict[best_inna_key]
-        log_loss = np.log10(np.clip(loss, 1e-10, None))
-        shade_plot(ax_bot, epochs, log_loss,
-                   r'INNA $\propto k^{-1/4}$', '#d62728', '-')
-    if 'ADAM' in results_dict:
-        acc, loss, _ = results_dict['ADAM']
-        log_loss = np.log10(np.clip(loss, 1e-10, None))
-        shade_plot(ax_bot, epochs, log_loss, 'ADAM', '#ff7f0e', '-', '^')
+    # Bottom: best INNA (q=1/4) vs ADAM
+    if 'INNA_q=0.250' in results:
+        r = results['INNA_q=0.250']
+        _shade(ax_bot, epochs,
+               np.log10(np.clip(r['loss'], 1e-10, None)),
+               r'INNA $\propto k^{-1/4}$', '#d62728', '-')
+    if 'ADAM' in results:
+        r = results['ADAM']
+        _shade(ax_bot, epochs,
+               np.log10(np.clip(r['loss'], 1e-10, None)),
+               'ADAM', '#ff7f0e', '-', '^')
 
-    ax_bot.set_ylabel(r'Training $\log_{10}(\mathcal{J}(\theta))$')
+    ax_bot.set_ylabel(r'$\log_{10}(\mathcal{J}(\theta))$')
     ax_bot.set_xlabel('Epochs')
-    ax_bot.set_title(f'{dataset} — INNA (best decay) vs ADAM')
+    ax_bot.set_title(f'{dataset} - INNA (best decay) vs ADAM')
     ax_bot.legend(fontsize=8)
     ax_bot.grid(True, alpha=0.3)
-
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'fig4_decay_{dataset}.png'), dpi=150)
+    plt.savefig(os.path.join(output_dir, f'fig4_decay_{dataset}.png'),
+                dpi=150)
     plt.close()
 
 
-def plot_sina_comparison(output_dir, dataset, results_dict, full_epochs):
-    """Plot SINA vs INNA comparison with epsilon trajectory."""
+def plot_sina_vs_inna(output_dir, dataset, sina_res, inna_res, full_epochs):
+    """SINA vs INNA: loss, accuracy (smoothed), accuracy (ReLU), epsilon."""
     epochs = np.arange(1, full_epochs + 1)
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    ax_acc, ax_loss, ax_eps = axes
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    (ax_loss, ax_acc_s), (ax_acc_r, ax_eps) = axes
 
-    for label, (acc, loss, eps) in sorted(results_dict.items()):
-        color = COLORS.get(label, 'gray')
-        ls = LINESTYLES.get(label, '-')
-
-        shade_plot(ax_acc, epochs, acc, label, color, ls)
-
-        log_loss = np.log10(np.clip(loss, 1e-10, None))
-        shade_plot(ax_loss, epochs, log_loss, label, color, ls)
-
-        if eps is not None:
-            ax_eps.plot(epochs, eps, label=label, color=color, linestyle='--')
-
-    ax_acc.set_title(f'{dataset} — Test Accuracy')
-    ax_acc.set_xlabel('Epochs')
-    ax_acc.set_ylabel('Test Accuracy')
-    ax_acc.legend(fontsize=8)
-    ax_acc.grid(True, alpha=0.3)
-
-    ax_loss.set_title(f'{dataset} — Training Loss')
-    ax_loss.set_xlabel('Epochs')
+    # Training loss
+    _shade(ax_loss, epochs,
+           np.log10(np.clip(inna_res['loss'], 1e-10, None)),
+           'INNA', COLORS['INNA'])
+    _shade(ax_loss, epochs,
+           np.log10(np.clip(sina_res['loss'], 1e-10, None)),
+           'SINA', COLORS['SINA'])
+    ax_loss.set_title(f'{dataset} - Training Loss')
     ax_loss.set_ylabel(r'$\log_{10}(\mathcal{J})$')
+    ax_loss.set_xlabel('Epochs')
     ax_loss.legend(fontsize=8)
     ax_loss.grid(True, alpha=0.3)
 
-    ax_eps.set_title(f'{dataset} — Epsilon Schedule')
-    ax_eps.set_xlabel('Epochs')
+    # Test accuracy (smoothed eval)
+    _shade(ax_acc_s, epochs, inna_res['accuracy'], 'INNA', COLORS['INNA'])
+    _shade(ax_acc_s, epochs, sina_res['accuracy'], 'SINA (smoothed)',
+           COLORS['SINA'])
+    ax_acc_s.set_title(f'{dataset} - Test Accuracy (smoothed eval)')
+    ax_acc_s.set_ylabel('Test Accuracy')
+    ax_acc_s.set_xlabel('Epochs')
+    ax_acc_s.legend(fontsize=8)
+    ax_acc_s.grid(True, alpha=0.3)
+
+    # Test accuracy (ReLU eval) - the fair comparison
+    _shade(ax_acc_r, epochs, inna_res['accuracy'], 'INNA (ReLU)',
+           COLORS['INNA'])
+    _shade(ax_acc_r, epochs, sina_res['accuracy_relu'],
+           'SINA (ReLU eval)', COLORS['SINA (relu)'], '--')
+    ax_acc_r.set_title(f'{dataset} - Test Accuracy (ReLU eval, fair comparison)')
+    ax_acc_r.set_ylabel('Test Accuracy')
+    ax_acc_r.set_xlabel('Epochs')
+    ax_acc_r.legend(fontsize=8)
+    ax_acc_r.grid(True, alpha=0.3)
+
+    # Epsilon trajectory
+    eps_data = sina_res['epsilon']  # (n_seeds, epochs)
+    eps_mean = np.mean(eps_data, axis=0)
+    eps_lo = np.min(eps_data, axis=0)
+    eps_hi = np.max(eps_data, axis=0)
+    ax_eps.semilogy(epochs, eps_mean, color=COLORS['SINA'], linewidth=2,
+                    label=r'$\varepsilon$ (mean)')
+    ax_eps.fill_between(epochs, eps_lo, eps_hi, color=COLORS['SINA'],
+                        alpha=0.15)
+    ax_eps.set_title(f'{dataset} - Epsilon Trajectory')
     ax_eps.set_ylabel(r'$\varepsilon$')
-    ax_eps.set_yscale('log')
+    ax_eps.set_xlabel('Epochs')
     ax_eps.legend(fontsize=8)
     ax_eps.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'sina_comparison_{dataset}.png'), dpi=150)
+    plt.savefig(os.path.join(output_dir, f'sina_vs_inna_{dataset}.png'),
+                dpi=150)
+    plt.close()
+
+
+def plot_delta_sigma_heatmap(output_dir, dataset, heatmap, deltas, sigmas,
+                             best_delta, best_sigma):
+    """Heatmap of training loss over (delta, sigma) grid."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(heatmap, cmap='viridis_r', aspect='auto')
+    ax.set_xticks(range(len(sigmas)))
+    ax.set_xticklabels([f'{s:.1f}' for s in sigmas])
+    ax.set_yticks(range(len(deltas)))
+    ax.set_yticklabels([f'{d:.1f}' for d in deltas])
+    ax.set_xlabel(r'$\sigma$ (eps reduction factor)')
+    ax.set_ylabel(r'$\delta$ (gradient-norm threshold)')
+    ax.set_title(f'{dataset} - SINA (delta, sigma) Sensitivity\n'
+                 f'Best: delta={best_delta}, sigma={best_sigma}')
+
+    # Annotate cells
+    for i in range(len(deltas)):
+        for j in range(len(sigmas)):
+            val = heatmap[i, j]
+            if np.isfinite(val):
+                ax.text(j, i, f'{val:.3f}', ha='center', va='center',
+                        fontsize=8, color='white' if val > np.nanmedian(heatmap)
+                        else 'black')
+
+    plt.colorbar(im, ax=ax, label='Training Loss (15 epochs)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'heatmap_delta_sigma_{dataset}.png'),
+                dpi=150)
     plt.close()
 
 
 # ============================================================
-# 9. SINA HYPERPARAMETER SEARCH
+# 9. PHASE 1 - Reproduce INNA Paper (Figures 2, 3, 4)
 # ============================================================
-def sina_grid_search(device, dataset, search_epochs, batch_size, num_workers):
-    """Grid search for SINA hyperparameters.
+def run_phase1(args, device):
+    seeds = list(range(args.num_seeds))
 
-    Searches over alpha, beta, gamma, eps0, sigma, delta.
-    Selects based on TRAINING LOSS (not test accuracy).
-    """
-    print(f"\n--- SINA Grid Search ({dataset}) ---")
+    for dataset in args.datasets:
+        print(f"\n{'='*60}")
+        print(f"  PHASE 1 - {dataset}")
+        print(f"{'='*60}")
 
-    alphas = [0.1, 0.5]
-    betas = [0.05, 0.1]
-    gammas = [0.005, 0.01, 0.05]
-    # eps0, sigma, delta are less sensitive — fix reasonable defaults
+        # ---- Figure 2: INNA (alpha,beta) sensitivity ----
+        print(f"\n--- Figure 2: INNA sensitivity ({dataset}) ---")
+        configs = [(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.5, 1.0)]
+        fig2 = {}
+
+        for alpha, beta in configs:
+            label = f'INNA_({alpha},{beta})'
+            key = f'p1_fig2_{dataset}_{label}'
+
+            if result_exists(args.output_dir, key):
+                print(f"  [Cached] {label}")
+                fig2[label] = load_result(args.output_dir, key)
+                continue
+
+            best_lr, _ = grid_search_gamma0(
+                device, dataset, 'inna', args.search_epochs,
+                args.batch_size, args.num_workers,
+                extra_kwargs={'alpha': alpha, 'beta': beta})
+
+            res = run_multi_seed_inna(
+                device, dataset, seeds, args.full_epochs,
+                args.batch_size, args.num_workers, args.compile,
+                label, alpha=alpha, beta=beta, lr=best_lr)
+
+            res['best_gamma0'] = best_lr
+            res['params'] = {'alpha': alpha, 'beta': beta}
+            save_result(args.output_dir, key, {
+                k: _to_list(v) for k, v in res.items()})
+            fig2[label] = res
+
+        plot_figure2(args.output_dir, dataset, fig2, args.full_epochs)
+
+        # ---- Figure 3: INNA vs baselines ----
+        print(f"\n--- Figure 3: INNA vs baselines ({dataset}) ---")
+        fig3 = {}
+
+        # Reuse best INNA config (0.5, 0.1) from Figure 2
+        fig3['INNA'] = fig2['INNA_(0.5,0.1)']
+
+        for opt_name in ['SGD', 'ADAM', 'ADAGRAD']:
+            key = f'p1_fig3_{dataset}_{opt_name}'
+
+            if result_exists(args.output_dir, key):
+                print(f"  [Cached] {opt_name}")
+                fig3[opt_name] = load_result(args.output_dir, key)
+                continue
+
+            best_lr, _ = grid_search_gamma0(
+                device, dataset, opt_name.lower(), args.search_epochs,
+                args.batch_size, args.num_workers)
+
+            res = run_multi_seed_baseline(
+                device, dataset, seeds, args.full_epochs,
+                args.batch_size, args.num_workers, args.compile,
+                opt_name, opt_name=opt_name, lr=best_lr)
+
+            res['best_gamma0'] = best_lr
+            save_result(args.output_dir, key, {
+                k: _to_list(v) for k, v in res.items()})
+            fig3[opt_name] = res
+
+        plot_figure3(args.output_dir, dataset, fig3, args.full_epochs)
+
+        # ---- Figure 4: decay exponents ----
+        print(f"\n--- Figure 4: decay exponents ({dataset}) ---")
+        fig4 = {}
+
+        for q in [0.5, 0.25, 0.125, 0.0625]:
+            label = f'INNA_q={q:.4g}'
+            key = f'p1_fig4_{dataset}_{label}'
+
+            if result_exists(args.output_dir, key):
+                print(f"  [Cached] {label}")
+                fig4[label] = load_result(args.output_dir, key)
+                continue
+
+            best_lr, _ = grid_search_gamma0(
+                device, dataset, 'inna', args.search_epochs,
+                args.batch_size, args.num_workers,
+                extra_kwargs={'alpha': 0.5, 'beta': 0.1, 'decaypower': q})
+
+            res = run_multi_seed_inna(
+                device, dataset, seeds, args.full_epochs,
+                args.batch_size, args.num_workers, args.compile,
+                label, alpha=0.5, beta=0.1, lr=best_lr, decaypower=q)
+
+            res['best_gamma0'] = best_lr
+            res['params'] = {'alpha': 0.5, 'beta': 0.1, 'decaypower': q}
+            save_result(args.output_dir, key, {
+                k: _to_list(v) for k, v in res.items()})
+            fig4[label] = res
+
+        # Add ADAM from fig3 for bottom panel
+        if 'ADAM' in fig3:
+            fig4['ADAM'] = fig3['ADAM']
+
+        plot_figure4(args.output_dir, dataset, fig4, args.full_epochs)
+
+
+# ============================================================
+# 10. PHASE 2 - SINA Comparison
+# ============================================================
+def run_phase2(args, device):
+    seeds = list(range(args.num_seeds))
+    alpha, beta = 0.5, 0.1  # INNA's best
     eps0 = 0.5
-    sigma = 0.5
-    delta = 1.0
 
-    best_loss = float('inf')
-    best_params = dict(alpha=0.5, beta=0.1, gamma=0.01, eps0=0.5,
-                       sigma=0.5, delta=1.0)
+    delta_values = [0.1, 0.5, 1.0, 5.0]
+    sigma_values = [0.3, 0.5, 0.7, 0.9]
 
-    for a in alphas:
-        for b in betas:
-            for g in gammas:
-                try:
-                    _, loss_hist, _ = train_sina(
-                        device, search_epochs, dataset,
-                        alpha=a, beta=b, gamma=g, eps0=eps0,
-                        sigma=sigma, delta=delta,
-                        batch_size=batch_size, num_workers=num_workers,
-                        prune=True)
-                    final_loss = loss_hist[-1] if loss_hist else float('inf')
-                    if np.isfinite(final_loss) and final_loss < best_loss:
-                        best_loss = final_loss
-                        best_params = dict(alpha=a, beta=b, gamma=g,
-                                           eps0=eps0, sigma=sigma, delta=delta)
-                    print(f"    a={a} b={b} g={g} -> loss={final_loss:.4f}")
-                except Exception as e:
-                    print(f"    a={a} b={b} g={g} -> FAILED: {e}")
+    for dataset in args.datasets:
+        print(f"\n{'='*60}")
+        print(f"  PHASE 2 - {dataset}")
+        print(f"{'='*60}")
 
-    print(f"  Best SINA params: {best_params} (loss={best_loss:.4f})")
-    return best_params
+        # Load INNA baseline from Phase 1
+        inna_key = f'p1_fig2_{dataset}_INNA_(0.5,0.1)'
+        if not result_exists(args.output_dir, inna_key):
+            print(f"  WARNING: Phase 1 INNA result not found for {dataset}.")
+            print(f"  Run --phases 1 first. Skipping {dataset}.")
+            continue
+        inna_res = load_result(args.output_dir, inna_key)
 
+        # Step 1: Grid search constant gamma for SINA
+        print(f"\n--- Step 1: SINA gamma grid search ({dataset}) ---")
+        gamma_key = f'p2_gamma_{dataset}'
+        if result_exists(args.output_dir, gamma_key):
+            cached = load_result(args.output_dir, gamma_key)
+            best_gamma = cached['best_gamma']
+            print(f"  [Cached] best_gamma={best_gamma}")
+        else:
+            best_gamma, gamma_log = grid_search_gamma0(
+                device, dataset, 'sina', args.search_epochs,
+                args.batch_size, args.num_workers,
+                extra_kwargs={'alpha': alpha, 'beta': beta,
+                              'eps0': eps0, 'sigma': 0.5, 'delta': 1.0})
+            save_result(args.output_dir, gamma_key, {
+                'best_gamma': best_gamma,
+                'search_log': gamma_log,
+            })
 
-def sina_bayes_search(device, dataset, search_epochs, batch_size, num_workers):
-    """Bayesian optimization for SINA hyperparameters using Optuna."""
-    try:
-        import optuna
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-    except ImportError:
-        print("  Optuna not installed, skipping Bayesian search")
-        return None
+        # Step 2: Delta-sigma sensitivity grid
+        print(f"\n--- Step 2: (delta, sigma) sensitivity ({dataset}) ---")
+        heatmap_key = f'p2_heatmap_{dataset}'
+        if result_exists(args.output_dir, heatmap_key):
+            cached = load_result(args.output_dir, heatmap_key)
+            heatmap = cached['heatmap']
+            best_delta = cached['best_delta']
+            best_sigma = cached['best_sigma']
+            print(f"  [Cached] best_delta={best_delta}, best_sigma={best_sigma}")
+        else:
+            heatmap = np.full((len(delta_values), len(sigma_values)), np.inf)
+            best_loss = float('inf')
+            best_delta, best_sigma = 1.0, 0.5
 
-    print(f"\n--- SINA Bayesian Search ({dataset}) ---")
+            for i, delta in enumerate(delta_values):
+                for j, sigma in enumerate(sigma_values):
+                    try:
+                        _, _, loss_h, _ = train_sina(
+                            device, args.search_epochs, dataset,
+                            alpha=alpha, beta=beta, gamma=best_gamma,
+                            eps0=eps0, sigma=sigma, delta=delta,
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers, seed=0)
+                        fl = loss_h[-1] if loss_h else float('inf')
+                        heatmap[i, j] = fl
+                        if np.isfinite(fl) and fl < best_loss:
+                            best_loss = fl
+                            best_delta, best_sigma = delta, sigma
+                        print(f"    delta={delta:.1f} sigma={sigma:.1f} "
+                              f"-> loss={fl:.4f}")
+                    except Exception as e:
+                        print(f"    delta={delta:.1f} sigma={sigma:.1f} "
+                              f"-> FAILED: {e}")
 
-    def objective(trial):
-        alpha = trial.suggest_float("alpha", 0.1, 1.0)
-        beta = trial.suggest_float("beta", 0.01, 0.5)
-        gamma = trial.suggest_float("gamma", 0.001, 0.1, log=True)
-        eps0 = trial.suggest_float("eps0", 0.1, 1.0)
-        sigma = trial.suggest_float("sigma", 0.3, 0.9)
-        delta = trial.suggest_float("delta", 0.1, 5.0)
+            print(f"  => Best: delta={best_delta}, sigma={best_sigma} "
+                  f"(loss={best_loss:.4f})")
+            save_result(args.output_dir, heatmap_key, {
+                'heatmap': _to_list(heatmap),
+                'best_delta': best_delta,
+                'best_sigma': best_sigma,
+                'delta_values': delta_values,
+                'sigma_values': sigma_values,
+            })
 
-        try:
-            _, loss_hist, _ = train_sina(
-                device, search_epochs, dataset,
-                alpha=alpha, beta=beta, gamma=gamma, eps0=eps0,
-                sigma=sigma, delta=delta,
-                batch_size=batch_size, num_workers=num_workers,
-                prune=True)
-            final_loss = loss_hist[-1] if loss_hist else float('inf')
-            return final_loss
-        except Exception:
-            return float('inf')
+        plot_delta_sigma_heatmap(args.output_dir, dataset, heatmap,
+                                delta_values, sigma_values,
+                                best_delta, best_sigma)
 
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=20, show_progress_bar=False)
-    print(f"  Best Bayes params: {study.best_params} (loss={study.best_value:.4f})")
-    return study.best_params
+        # Step 3: Full SINA run with best config
+        print(f"\n--- Step 3: Full SINA run ({dataset}) ---")
+        sina_key = f'p2_sina_{dataset}'
+        if result_exists(args.output_dir, sina_key):
+            print(f"  [Cached] SINA full run")
+            sina_res = load_result(args.output_dir, sina_key)
+        else:
+            sina_res = run_multi_seed_sina(
+                device, dataset, seeds, args.full_epochs,
+                args.batch_size, args.num_workers, args.compile,
+                'SINA',
+                alpha=alpha, beta=beta, gamma=best_gamma,
+                eps0=eps0, sigma=best_sigma, delta=best_delta)
+
+            sina_res['params'] = {
+                'alpha': alpha, 'beta': beta, 'gamma': best_gamma,
+                'eps0': eps0, 'sigma': best_sigma, 'delta': best_delta,
+            }
+            save_result(args.output_dir, sina_key, {
+                k: _to_list(v) for k, v in sina_res.items()})
+
+        # Step 4: Plots
+        print(f"\n--- Step 4: Plots ({dataset}) ---")
+        plot_sina_vs_inna(args.output_dir, dataset, sina_res, inna_res,
+                          args.full_epochs)
+
+        print(f"  Done with {dataset}.")
 
 
 # ============================================================
-# 10. MAIN ORCHESTRATION
+# 11. MAIN
 # ============================================================
 def main():
     args = parse_args()
 
-    if args.gpu and torch.cuda.is_available():
-        device = torch.device('cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision('high')
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
     else:
-        device = torch.device('cpu')
-        print("Using CPU")
+        print("WARNING: Running on CPU - this will be very slow.")
 
-    print(f"Config: epochs={args.full_epochs}, seeds={args.num_seeds}, "
-          f"batch={args.batch_size}, datasets={args.datasets}")
-
+    print(f"Config: phases={args.phases}, datasets={args.datasets}, "
+          f"epochs={args.full_epochs}, seeds={args.num_seeds}, "
+          f"batch={args.batch_size}")
     os.makedirs(args.output_dir, exist_ok=True)
-    start_time = time.time()
 
-    for dataset in args.datasets:
-        print(f"\n{'='*60}")
-        print(f"  DATASET: {dataset}")
-        print(f"{'='*60}")
+    start = time.time()
 
-        all_results = {}  # label -> (acc_np, loss_np, eps_np)
+    if 1 in args.phases:
+        print("\n" + "=" * 60)
+        print("  PHASE 1: Reproduce INNA Paper (Figures 2, 3, 4)")
+        print("=" * 60)
+        run_phase1(args, device)
 
-        # ========================================
-        # EXPERIMENT 1: INNA (alpha,beta) Sensitivity (Figure 2)
-        # ========================================
-        if not args.skip_sensitivity:
-            print(f"\n--- Experiment 1: INNA Sensitivity Study ({dataset}) ---")
-            configs = [(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.5, 1.0)]
-            fig2_results = {}
+    if 2 in args.phases:
+        print("\n" + "=" * 60)
+        print("  PHASE 2: SINA Comparison")
+        print("=" * 60)
+        run_phase2(args, device)
 
-            for alpha, beta in configs:
-                label = f'INNA_({alpha},{beta})'
-                cached = load_results(args.output_dir, dataset, label)
-                if cached is not None:
-                    print(f"  [Loaded cached {label}]")
-                    fig2_results[label] = cached
-                    continue
-
-                # Grid search gamma_0 for this (alpha, beta) config
-                print(f"  Finding gamma_0 for INNA(a={alpha}, b={beta})...")
-                best_lr = grid_search_lr(
-                    device, dataset, train_inna, args.search_epochs,
-                    args.batch_size, args.num_workers,
-                    extra_kwargs=dict(alpha=alpha, beta=beta))
-
-                acc, loss, eps = run_multi_seed(
-                    train_inna, device, dataset, args.num_seeds,
-                    args.full_epochs, args.batch_size, args.num_workers,
-                    method_label=label,
-                    extra_kwargs=dict(alpha=alpha, beta=beta, lr=best_lr),
-                    use_compile=args.compile)
-
-                fig2_results[label] = (acc, loss, eps)
-                save_results(args.output_dir, dataset, label, acc, loss, eps)
-
-            plot_figure2(args.output_dir, dataset, fig2_results, args.full_epochs)
-
-            # Use the best INNA config for subsequent comparisons
-            # INNA paper says (0.5, 0.1) is a good default
-            best_inna_label = 'INNA_(0.5,0.1)'
-            if best_inna_label in fig2_results:
-                all_results['INNA'] = fig2_results[best_inna_label]
-        else:
-            # Just run INNA with default (0.5, 0.1)
-            label = 'INNA'
-            cached = load_results(args.output_dir, dataset, label)
-            if cached is not None:
-                print(f"  [Loaded cached INNA]")
-                all_results['INNA'] = cached
-            else:
-                print(f"\n--- Running INNA (default config) ({dataset}) ---")
-                best_lr = grid_search_lr(
-                    device, dataset, train_inna, args.search_epochs,
-                    args.batch_size, args.num_workers,
-                    extra_kwargs=dict(alpha=0.5, beta=0.1))
-
-                acc, loss, eps = run_multi_seed(
-                    train_inna, device, dataset, args.num_seeds,
-                    args.full_epochs, args.batch_size, args.num_workers,
-                    method_label=label,
-                    extra_kwargs=dict(alpha=0.5, beta=0.1, lr=best_lr),
-                    use_compile=args.compile)
-
-                all_results['INNA'] = (acc, loss, eps)
-                save_results(args.output_dir, dataset, label, acc, loss, eps)
-
-        # ========================================
-        # EXPERIMENT 2: Baselines — SGD, ADAM, ADAGRAD (Figure 3)
-        # ========================================
-        if not args.skip_baselines:
-            print(f"\n--- Experiment 2: Baselines ({dataset}) ---")
-            for opt_name in ['SGD', 'ADAM', 'ADAGRAD']:
-                cached = load_results(args.output_dir, dataset, opt_name)
-                if cached is not None:
-                    print(f"  [Loaded cached {opt_name}]")
-                    all_results[opt_name] = cached
-                    continue
-
-                print(f"  Finding gamma_0 for {opt_name}...")
-                best_lr = grid_search_lr(
-                    device, dataset, train_baseline, args.search_epochs,
-                    args.batch_size, args.num_workers,
-                    extra_kwargs=dict(opt_name=opt_name))
-
-                acc, loss, eps = run_multi_seed(
-                    train_baseline, device, dataset, args.num_seeds,
-                    args.full_epochs, args.batch_size, args.num_workers,
-                    method_label=opt_name,
-                    extra_kwargs=dict(opt_name=opt_name, lr=best_lr),
-                    use_compile=args.compile)
-
-                all_results[opt_name] = (acc, loss, eps)
-                save_results(args.output_dir, dataset, opt_name, acc, loss, eps)
-
-            # Plot Figure 3: INNA vs baselines
-            fig3_data = {}
-            for k in ['INNA', 'SGD', 'ADAM', 'ADAGRAD']:
-                if k in all_results:
-                    fig3_data[k] = all_results[k]
-            if fig3_data:
-                plot_figure3(args.output_dir, dataset, fig3_data, args.full_epochs)
-
-        # ========================================
-        # EXPERIMENT 3: Step-size Decay Exponents (Figure 4)
-        # ========================================
-        if not args.skip_decay_study:
-            print(f"\n--- Experiment 3: Decay Exponent Study ({dataset}) ---")
-            decay_results = {}
-            q_values = [0.5, 0.25, 0.125, 0.0625]
-
-            for q in q_values:
-                label = f'INNA_q={q:.4g}'
-                cached = load_results(args.output_dir, dataset, label)
-                if cached is not None:
-                    print(f"  [Loaded cached {label}]")
-                    decay_results[label] = cached
-                    continue
-
-                # Grid search gamma_0 for this decay exponent
-                print(f"  Finding gamma_0 for INNA(q={q})...")
-                best_lr = grid_search_lr(
-                    device, dataset, train_inna, args.search_epochs,
-                    args.batch_size, args.num_workers,
-                    extra_kwargs=dict(alpha=0.5, beta=0.1, decaypower=q))
-
-                acc, loss, eps = run_multi_seed(
-                    train_inna, device, dataset, args.num_seeds,
-                    args.full_epochs, args.batch_size, args.num_workers,
-                    method_label=label,
-                    extra_kwargs=dict(alpha=0.5, beta=0.1, lr=best_lr,
-                                     decaypower=q),
-                    use_compile=args.compile)
-
-                decay_results[label] = (acc, loss, eps)
-                save_results(args.output_dir, dataset, label, acc, loss, eps)
-
-            # Add ADAM for the bottom panel of Figure 4
-            if 'ADAM' in all_results:
-                decay_results['ADAM'] = all_results['ADAM']
-
-            plot_figure4(args.output_dir, dataset, decay_results, args.full_epochs)
-
-        # ========================================
-        # EXPERIMENT 4: SINA with Adaptive Epsilon
-        # ========================================
-        if not args.skip_sina:
-            print(f"\n--- Experiment 4: SINA ({dataset}) ---")
-
-            # Grid search
-            grid_params = sina_grid_search(
-                device, dataset, args.search_epochs,
-                args.batch_size, args.num_workers)
-
-            label_grid = 'SINA_Grid'
-            acc, loss, eps = run_multi_seed(
-                train_sina, device, dataset, args.num_seeds,
-                args.full_epochs, args.batch_size, args.num_workers,
-                method_label=label_grid,
-                extra_kwargs=grid_params,
-                use_compile=args.compile)
-            all_results[label_grid] = (acc, loss, eps)
-            save_results(args.output_dir, dataset, label_grid, acc, loss, eps)
-
-            # Bayesian search
-            bayes_params = sina_bayes_search(
-                device, dataset, args.search_epochs,
-                args.batch_size, args.num_workers)
-            if bayes_params is not None:
-                label_bayes = 'SINA_Bayes'
-                acc, loss, eps = run_multi_seed(
-                    train_sina, device, dataset, args.num_seeds,
-                    args.full_epochs, args.batch_size, args.num_workers,
-                    method_label=label_bayes,
-                    extra_kwargs=bayes_params,
-                    use_compile=args.compile)
-                all_results[label_bayes] = (acc, loss, eps)
-                save_results(args.output_dir, dataset, label_bayes, acc, loss, eps)
-
-            # Plot SINA comparison
-            sina_plot_data = {}
-            for k in ['INNA', 'SINA_Grid', 'SINA_Bayes']:
-                if k in all_results:
-                    sina_plot_data[k] = all_results[k]
-            if sina_plot_data:
-                plot_sina_comparison(args.output_dir, dataset, sina_plot_data,
-                                    args.full_epochs)
-
-    elapsed = (time.time() - start_time) / 3600
-    print(f"\nAll experiments finished. Total time: {elapsed:.2f} hours.")
+    elapsed = (time.time() - start) / 3600
+    print(f"\nAll phases complete. Total time: {elapsed:.2f} hours.")
 
 
 if __name__ == "__main__":

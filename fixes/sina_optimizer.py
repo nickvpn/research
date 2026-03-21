@@ -1,8 +1,7 @@
 """
-SINA — Smoothing Inertial Newton Algorithm (Chadli et al. 2025)
+SINA -- Smoothing Inertial Newton Algorithm (Chadli et al. 2025)
 "A smoothing approximation approach to dynamical inertial newton systems
  for non-smooth and non-convex optimization: the deterministic case"
-
 Implements Algorithm 4.1 faithfully:
 
   Step 1: Choose alpha > 0, beta > 0, sigma in (0,1), gamma_k > 0,
@@ -14,16 +13,6 @@ Implements Algorithm 4.1 faithfully:
                eps_{k+1} = eps_k
            else:
                eps_{k+1} = sigma * eps_k
-
-Key differences from the old code:
-  1. gamma_k is a CONSTANT (not decaying). The SINA paper's Assumption 2(iii)
-     requires lim inf gamma_k > 0. The "decay" in SINA comes from shrinking eps,
-     not from shrinking gamma.
-  2. The adaptive eps schedule uses the gradient-norm criterion (Step 4), not
-     blind exponential decay.
-  3. The step is applied per-iteration (mini-batch), not per-epoch.
-  4. phi_0 can be initialized from an initial gradient pass.
-
 The Zang smoothing P_{rho_Z}(t, eps) replaces ReLU:
   P(t, eps) = t                         if t > eps/2
             = (1/(2*eps)) * (t + eps/2)^2  if -eps/2 <= t <= eps/2
@@ -61,7 +50,7 @@ def zang_plus(t, eps):
 
 
 # ============================================================
-# SINA Step — Explicit Euler discretization of Eq. 19
+# SINA Step - Explicit Euler discretization of Eq. 19
 # ============================================================
 def sina_step_fn(model, phi_list, alpha, beta, gamma_k):
     """One SINA parameter update (Algorithm 4.1, Step 3).

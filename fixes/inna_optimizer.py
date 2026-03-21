@@ -1,8 +1,8 @@
 """
-Fixed INNA Optimizer — matches Castera et al. (2021) "An Inertial Newton Algorithm
+Fixed INNA Optimizer - matches Castera et al. (2021) "An Inertial Newton Algorithm
 for Deep Learning", Table 1 / Eq. 12.
 
-Fixes vs. original research/Optimization/inna.py:
+Fixes vs. original inna.py:
   1. Deprecated two-arg .sub_(scalar, tensor) replaced with .sub_(scalar * tensor)
   2. psi_0 initialization includes the gradient term from Section 5.2.1 p.22:
        psi_0 = (1 - alpha*beta)*theta_0 - (beta^2 - beta)*grad(theta_0)
